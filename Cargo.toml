@@ -1,0 +1,26 @@
+[package]
+name = "actix-ip-filter"
+description = "IP filter of HTTP requests for Actix Framework"
+license = "MIT"
+readme = "README.md"
+keywords = ["actix", "ip", "filter"]
+homepage = "https://github.com/jhen0409/actix-ip-filter"
+repository = "https://github.com/jhen0409/actix-ip-filter.git"
+documentation = "https://docs.rs/actix-ip-filter/"
+version = "0.1.0"
+authors = ["jhen <developer@jhen.me>"]
+edition = "2018"
+exclude = [".github/*"]
+
+[lib]
+name = "actix_ip_filter"
+path = "src/lib.rs"
+
+[dependencies]
+actix-service = "1.0.6"
+actix-web = "3.0.1"
+futures = "0.3.5"
+glob = "0.3.0"
+
+[dev-dependencies]
+actix-rt = "1.1.1"
