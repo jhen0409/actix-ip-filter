@@ -164,9 +164,7 @@ where
         if (self.allowlist.len() > 0 && !self.allowlist.iter().any(|re| re.matches(&ip)))
             || self.blocklist.iter().any(|re| re.matches(&ip))
         {
-            return Box::pin(ok(req.error_response(ErrorForbidden(
-                "Your address isn't allowed to access this endpoint.",
-            ))));
+            return Box::pin(ok(req.error_response(ErrorForbidden("Forbidden"))));
         }
 
         Box::pin(self.service.call(req))
