@@ -70,7 +70,7 @@ impl IPFilter {
         }
     }
 
-    /// Use `X-REAL-IP` to check IP if it is found in request.
+    /// Use `X-REAL-IP` header to check IP if it is found in request.
     pub fn x_real_ip(mut self, enabled: bool) -> Self {
         self.use_x_real_ip = enabled;
         self
