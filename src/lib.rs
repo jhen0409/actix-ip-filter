@@ -7,7 +7,7 @@
 //! ```rust
 //! use actix_web::{App, HttpServer, HttpRequest, web, middleware};
 //! use actix_ip_filter::IPFilter;
-//! 
+//!
 //! async fn index(req: HttpRequest) -> &'static str {
 //!     "Hello world"
 //! }
@@ -30,18 +30,21 @@
 //!     Ok(())
 //! }
 //! ```
-//! 
+//!
 
 use actix_service::{Service, Transform};
 use actix_web::{dev::ServiceRequest, dev::ServiceResponse, error::ErrorForbidden, Error};
-use futures::future::{ok, Ready};
-use futures::Future;
+use futures_util::future::{ok, Future, Ready};
 use glob::Pattern;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 fn wrap_pattern(list: Vec<&str>) -> Box<Vec<Pattern>> {
-    Box::new(list.iter().map(|rule| Pattern::new(rule).unwrap()).collect())
+    Box::new(
+        list.iter()
+            .map(|rule| Pattern::new(rule).unwrap())
+            .collect(),
+    )
 }
 
 /// Middleware for filter IP of HTTP requests
@@ -58,11 +61,7 @@ impl IPFilter {
     }
 
     /// Construct `IPFilter` middleware with the provided arguments
-    pub fn new_with_opts(
-        allowlist: Vec<&str>,
-        blocklist: Vec<&str>,
-        use_x_real_ip: bool,
-    ) -> Self {
+    pub fn new_with_opts(allowlist: Vec<&str>, blocklist: Vec<&str>, use_x_real_ip: bool) -> Self {
         IPFilter {
             use_x_real_ip,
             allowlist: wrap_pattern(allowlist),
@@ -179,11 +178,8 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_allowlist() {
-        let ip_filter = IPFilter::new_with_opts(
-            vec!["192.168.*.11?", "192.168.*.22?"],
-            vec![],
-            false,
-        );
+        let ip_filter =
+            IPFilter::new_with_opts(vec!["192.168.*.11?", "192.168.*.22?"], vec![], false);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
 
         let req = test::TestRequest::with_uri("test")
