@@ -38,21 +38,20 @@ use futures_util::future::{ok, Future, Ready};
 use glob::Pattern;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::rc::Rc;
 
-fn wrap_pattern(list: Vec<&str>) -> Box<Vec<Pattern>> {
-    Box::new(
-        list.iter()
-            .map(|rule| Pattern::new(rule).unwrap())
-            .collect(),
-    )
+fn wrap_pattern(list: Vec<&str>) -> Rc<Vec<Pattern>> {
+    Rc::new(list.iter()
+        .map(|rule| Pattern::new(rule).unwrap())
+        .collect())
 }
 
 /// Middleware for filter IP of HTTP requests
 #[derive(Default)]
 pub struct IPFilter {
     use_x_real_ip: bool,
-    allowlist: Box<Vec<Pattern>>,
-    blocklist: Box<Vec<Pattern>>,
+    allowlist: Rc<Vec<Pattern>>,
+    blocklist: Rc<Vec<Pattern>>,
 }
 
 
@@ -123,8 +122,8 @@ where
         ok(IPFilterMiddleware {
             service,
             use_x_real_ip: self.use_x_real_ip,
-            allowlist: self.allowlist.clone(),
-            blocklist: self.blocklist.clone(),
+            allowlist: Rc::clone(&self.allowlist),
+            blocklist: Rc::clone(&self.blocklist),
         })
     }
 }
@@ -132,8 +131,8 @@ where
 pub struct IPFilterMiddleware<S> {
     service: S,
     use_x_real_ip: bool,
-    allowlist: Box<Vec<Pattern>>,
-    blocklist: Box<Vec<Pattern>>,
+    allowlist: Rc<Vec<Pattern>>,
+    blocklist: Rc<Vec<Pattern>>,
 }
 
 impl<S, B> Service for IPFilterMiddleware<S>
@@ -162,7 +161,7 @@ where
             peer_addr_ip
         };
 
-        if (self.allowlist.len() > 0 && !self.allowlist.iter().any(|re| re.matches(&ip)))
+        if (!self.allowlist.is_empty() && !self.allowlist.iter().any(|re| re.matches(&ip)))
             || self.blocklist.iter().any(|re| re.matches(&ip))
         {
             return Box::pin(ok(req.error_response(ErrorForbidden("Forbidden"))));
