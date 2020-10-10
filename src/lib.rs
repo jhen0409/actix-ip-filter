@@ -48,16 +48,18 @@ fn wrap_pattern(list: Vec<&str>) -> Box<Vec<Pattern>> {
 }
 
 /// Middleware for filter IP of HTTP requests
+#[derive(Default)]
 pub struct IPFilter {
     use_x_real_ip: bool,
     allowlist: Box<Vec<Pattern>>,
     blocklist: Box<Vec<Pattern>>,
 }
 
+
 impl IPFilter {
     /// Construct `IPFilter` middleware with no arguments
     pub fn new() -> Self {
-        Self::new_with_opts(vec![], vec![], false)
+        Default::default()
     }
 
     /// Construct `IPFilter` middleware with the provided arguments
@@ -179,7 +181,7 @@ mod tests {
     #[actix_rt::test]
     async fn test_allowlist() {
         let ip_filter =
-            IPFilter::new_with_opts(vec!["192.168.*.11?", "192.168.*.22?"], vec![], false);
+            IPFilter::new().allow(vec!["192.168.*.11?", "192.168.*.22?"]);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
 
         let req = test::TestRequest::with_uri("test")
@@ -197,7 +199,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_blocklist() {
-        let ip_filter = IPFilter::new_with_opts(vec![], vec!["192.168.*.2?3"], false);
+        let ip_filter = IPFilter::new().block(vec!["192.168.*.2?3"]);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
 
         let req = test::TestRequest::with_uri("test")
@@ -215,7 +217,7 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_xrealip() {
-        let ip_filter = IPFilter::new_with_opts(vec!["192.168.*.11?"], vec![], true);
+        let ip_filter = IPFilter::new().allow(vec!["192.168.*.11?"]).x_real_ip(true);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
         let req = test::TestRequest::with_header("X-REAL-IP", "192.168.0.111")
             .peer_addr("192.168.0.222:8888".parse().unwrap())
