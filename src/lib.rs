@@ -113,7 +113,7 @@ impl IPFilter {
     }
 
     /// Construct `IPFilter` middleware with the provided arguments and limiting patterns.
-    pub fn new_with_opts_limited(allowlist: Vec<&str>, blocklist: Vec<&str>, limitlist: Vec<&str>) -> Self {
+    pub fn new_with_opts_limited(allowlist: Vec<&str>, blocklist: Vec<&str>, limitlist: Vec<&str>, use_x_real_ip: bool) -> Self {
         IPFilter {
             use_x_real_ip,
             allowlist: wrap_pattern(allowlist),
@@ -229,7 +229,7 @@ where
             peer_addr_ip
         };
 
-        if self.limitlist.is_empty() || self.limitlist.iter().any(|re| re.matches(req.path()))
+        if (self.limitlist.is_empty() || self.limitlist.iter().any(|re| re.matches(req.path())))
             && ((!self.allowlist.is_empty() && !self.allowlist.iter().any(|re| re.matches(&ip)))
             || self.blocklist.iter().any(|re| re.matches(&ip)))
         {
@@ -295,19 +295,23 @@ mod tests {
     }
 
     #[actix_rt::test]
-    async fn test_limit_list() {
+    async fn test_limitlist() {
         let ip_filter = IPFilter::new().block(vec!["192.168.*.11?"])
             .limit_to(vec!["/protected/path/*"]);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
-        let protected_req = test::TestRequest::with_uri("/protected/path/hello")
+
+        let req = test::TestRequest::with_uri("/protected/path/hello")
             .peer_addr("192.168.0.111:8888".parse().unwrap())
             .to_srv_request();
-        let unprotected_req = test::TestRequest::with_uri("/another/path")
+
+        let resp = test::call_service(&mut fltr, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let req = test::TestRequest::with_uri("/another/path")
             .peer_addr("192.168.0.111:8888".parse().unwrap())
             .to_srv_request();
-        let protected_resp = test::call_service(&mut fltr, req).await;
-        let unprotected_resp = test::call_service(&mut fltr, req).await;
-        assert_eq!(protected_resp.status(), StatusCode::FORBIDDEN);
-        assert_eq!(unprotected_resp.status(), StatusCode::OK);
+
+        let resp = test::call_service(&mut fltr, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }
