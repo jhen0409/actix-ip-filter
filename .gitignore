@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+
+# Jetbrains ItelliJ IDEA
+.idea/
+*.iml
