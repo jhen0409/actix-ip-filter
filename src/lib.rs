@@ -251,12 +251,7 @@ impl IPFilter {
     }
 
     /// Construct `IPFilter` middleware with the provided arguments and limiting patterns.
-    pub fn new_with_opts_limited(
-        allowlist: Vec<&str>,
-        blocklist: Vec<&str>,
-        limitlist: Vec<&str>,
-        use_x_real_ip: bool,
-    ) -> Self {
+    pub fn new_with_opts_limited(allowlist: Vec<&str>, blocklist: Vec<&str>, limitlist: Vec<&str>, use_x_real_ip: bool) -> Self {
         IPFilter {
             use_x_real_ip,
             allowlist: wrap_pattern(allowlist),
