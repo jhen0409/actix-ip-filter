@@ -29,6 +29,46 @@
 //!         .bind("0.0.0.0:8080")?;
 //!     Ok(())
 //! }
+//!
+//! ```
+//! ## Limiting to certain paths
+//! You can limit the allow/block actions to a certain set of patterns representing URL paths.
+//! The following code will only allow/block to paths matching the patterns `/my/path*` and
+//! `/my/other/*.csv`.
+//! ```rust
+//! use actix_web::{App, HttpServer, HttpRequest, web, middleware};
+//! use actix_ip_filter::IPFilter;
+//!
+//! async fn i_am_protected() -> &'static str {
+//!     "I am a protected resource"
+//! }
+//!
+//! async fn i_am_unprotected() -> &'static str {
+//!     "I am NOT a protected resource"
+//! }
+//!
+//! #[actix_web::main]
+//! async fn main() -> std::io::Result<()> {
+//!
+//!
+//!     HttpServer::new(|| App::new()
+//!         // enable logger
+//!         .wrap(middleware::Logger::default())
+//!         // setup ip filters
+//!         .wrap(
+//!             IPFilter::new()
+//!                 .allow(vec!["172.??.6*.12"])
+//!                 .block(vec!["192.168.1.222"])
+//!                 .limit_to(vec!["/my/path/*"])
+//!         )
+//!         // register simple protected route
+//!         .service(web::resource("/my/path/resource").to(i_am_protected))
+//!         // register simple unprotected route
+//!         .service(web::resource("/other/path/resource").to(i_am_unprotected))
+//!     )
+//!         .bind("0.0.0.0:8000");
+//!     Ok(())
+//! }
 //! ```
 //!
 
@@ -52,6 +92,7 @@ pub struct IPFilter {
     use_x_real_ip: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
+    limitlist: Rc<Vec<Pattern>>,
 }
 
 
@@ -61,12 +102,23 @@ impl IPFilter {
         Default::default()
     }
 
-    /// Construct `IPFilter` middleware with the provided arguments
+    /// Construct `IPFilter` middleware with the provided arguments and no limiting pattern.
     pub fn new_with_opts(allowlist: Vec<&str>, blocklist: Vec<&str>, use_x_real_ip: bool) -> Self {
         IPFilter {
             use_x_real_ip,
             allowlist: wrap_pattern(allowlist),
             blocklist: wrap_pattern(blocklist),
+            limitlist: wrap_pattern(vec![]),
+        }
+    }
+
+    /// Construct `IPFilter` middleware with the provided arguments and limiting patterns.
+    pub fn new_with_opts_limited(allowlist: Vec<&str>, blocklist: Vec<&str>, limitlist: Vec<&str>, use_x_real_ip: bool) -> Self {
+        IPFilter {
+            use_x_real_ip,
+            allowlist: wrap_pattern(allowlist),
+            blocklist: wrap_pattern(blocklist),
+            limitlist: wrap_pattern(limitlist),
         }
     }
 
@@ -103,6 +155,20 @@ impl IPFilter {
         self.blocklist = wrap_pattern(blocklist);
         self
     }
+
+    /// Set endpoint limit list, supporting glob pattern.
+    ///
+    /// ## Example
+    ///
+    /// ```
+    /// # use actix_ip_filter::IPFilter;
+    /// let middleware = IPFilter::new()
+    ///     .limit_to(vec!["/path/to/protected/resource*", "/protected/file/type/*.csv"]);
+    /// ```
+    pub fn limit_to(mut self, limitlist: Vec<&str>) -> Self {
+        self.limitlist = wrap_pattern(limitlist);
+        self
+    }
 }
 
 impl<S, B> Transform<S> for IPFilter
@@ -114,8 +180,8 @@ where
     type Request = ServiceRequest;
     type Response = ServiceResponse<B>;
     type Error = Error;
-    type InitError = ();
     type Transform = IPFilterMiddleware<S>;
+    type InitError = ();
     type Future = Ready<Result<Self::Transform, Self::InitError>>;
 
     fn new_transform(&self, service: S) -> Self::Future {
@@ -124,6 +190,7 @@ where
             use_x_real_ip: self.use_x_real_ip,
             allowlist: Rc::clone(&self.allowlist),
             blocklist: Rc::clone(&self.blocklist),
+            limitlist: Rc::clone(&self.limitlist)
         })
     }
 }
@@ -133,6 +200,7 @@ pub struct IPFilterMiddleware<S> {
     use_x_real_ip: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
+    limitlist: Rc<Vec<Pattern>>,
 }
 
 impl<S, B> Service for IPFilterMiddleware<S>
@@ -161,8 +229,9 @@ where
             peer_addr_ip
         };
 
-        if (!self.allowlist.is_empty() && !self.allowlist.iter().any(|re| re.matches(&ip)))
-            || self.blocklist.iter().any(|re| re.matches(&ip))
+        if (self.limitlist.is_empty() || self.limitlist.iter().any(|re| re.matches(req.path())))
+            && ((!self.allowlist.is_empty() && !self.allowlist.iter().any(|re| re.matches(&ip)))
+            || self.blocklist.iter().any(|re| re.matches(&ip)))
         {
             return Box::pin(ok(req.error_response(ErrorForbidden("Forbidden"))));
         }
@@ -221,6 +290,27 @@ mod tests {
         let req = test::TestRequest::with_header("X-REAL-IP", "192.168.0.111")
             .peer_addr("192.168.0.222:8888".parse().unwrap())
             .to_srv_request();
+        let resp = test::call_service(&mut fltr, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[actix_rt::test]
+    async fn test_limitlist() {
+        let ip_filter = IPFilter::new().block(vec!["192.168.*.11?"])
+            .limit_to(vec!["/protected/path/*"]);
+        let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
+
+        let req = test::TestRequest::with_uri("/protected/path/hello")
+            .peer_addr("192.168.0.111:8888".parse().unwrap())
+            .to_srv_request();
+
+        let resp = test::call_service(&mut fltr, req).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let req = test::TestRequest::with_uri("/another/path")
+            .peer_addr("192.168.0.111:8888".parse().unwrap())
+            .to_srv_request();
+
         let resp = test::call_service(&mut fltr, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
