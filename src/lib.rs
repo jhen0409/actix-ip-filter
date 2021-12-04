@@ -435,7 +435,7 @@ where
                 None
             };
             return if let Some(res) = response_opt {
-                Box::pin(ok(req.into_response(res).map_body(|_, body| AnyBody::new_boxed(body))))
+                Box::pin(ok(req.into_response(res)))
             } else {
                 Box::pin(ok(req.error_response(ErrorForbidden("Forbidden"))))
             };
