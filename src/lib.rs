@@ -192,12 +192,17 @@
 //! }
 //! ```
 
-
 use actix_service::{Service, Transform};
-use actix_web::{dev::ServiceRequest, dev::ServiceResponse, error::ErrorForbidden, Error, HttpResponse};
-use futures_util::future::{ok, Future, Ready};
+use actix_web::{
+    body::{AnyBody, MessageBody},
+    dev::{ServiceRequest, ServiceResponse},
+    error::ErrorForbidden,
+    Error, HttpResponse,
+};
+use futures_util::future::{ok, Either, FutureExt as _, LocalBoxFuture, Ready};
 use glob::Pattern;
 use std::pin::Pin;
+use std::error::Error as StdError;
 use std::rc::Rc;
 use std::task::{Context, Poll};
 
@@ -227,7 +232,7 @@ impl Default for IPFilter {
             blocklist: Rc::new(vec![]),
             limitlist: Rc::new(vec![]),
             allow_handler: None,
-            block_handler: None
+            block_handler: None,
         }
     }
 }
@@ -251,7 +256,12 @@ impl IPFilter {
     }
 
     /// Construct `IPFilter` middleware with the provided arguments and limiting patterns.
-    pub fn new_with_opts_limited(allowlist: Vec<&str>, blocklist: Vec<&str>, limitlist: Vec<&str>, use_x_real_ip: bool) -> Self {
+    pub fn new_with_opts_limited(
+        allowlist: Vec<&str>,
+        blocklist: Vec<&str>,
+        limitlist: Vec<&str>,
+        use_x_real_ip: bool,
+    ) -> Self {
         IPFilter {
             use_x_real_ip,
             allowlist: wrap_pattern(allowlist),
@@ -354,14 +364,14 @@ impl IPFilter {
     }
 }
 
-impl<S, B> Transform<S> for IPFilter
+impl<S, B> Transform<S, ServiceRequest> for IPFilter
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
-    B: 'static,
+    B: MessageBody + 'static,
+    B::Error: StdError,
 {
-    type Request = ServiceRequest;
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse;
     type Error = Error;
     type Transform = IPFilterMiddleware<S>;
     type InitError = ();
@@ -369,7 +379,7 @@ where
 
     fn new_transform(&self, service: S) -> Self::Future {
         ok(IPFilterMiddleware {
-            service,
+            service: Rc::new(service),
             use_x_real_ip: self.use_x_real_ip,
             allowlist: Rc::clone(&self.allowlist),
             blocklist: Rc::clone(&self.blocklist),
@@ -382,7 +392,7 @@ where
 
 #[derive(Clone)]
 pub struct IPFilterMiddleware<S> {
-    service: S,
+    service: Rc<S>,
     use_x_real_ip: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
@@ -391,22 +401,20 @@ pub struct IPFilterMiddleware<S> {
     block_handler: Option<fn(&IPFilter, &str, &ServiceRequest) -> Option<HttpResponse>>,
 }
 
-impl<S, B> Service for IPFilterMiddleware<S>
+impl<S, B> Service<ServiceRequest> for IPFilterMiddleware<S>
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
-    B: 'static,
+    B: MessageBody + 'static,
+    B::Error: StdError,
 {
-    type Request = ServiceRequest;
-    type Response = ServiceResponse<B>;
+    type Response = ServiceResponse;
     type Error = Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    type Future = LocalBoxFuture<'static, Result<ServiceResponse, Error>>;
 
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
-    }
+    actix_service::forward_ready!(service);
 
-    fn call(&mut self, req: ServiceRequest) -> Self::Future {
+    fn call(&self, req: ServiceRequest) -> Self::Future {
         let peer_addr_ip = req.peer_addr().unwrap().ip().to_string();
         let ip = if self.use_x_real_ip {
             match req.headers().get("X-REAL-IP") {
@@ -421,13 +429,13 @@ where
             && ((!self.allowlist.is_empty() && !self.allowlist.iter().any(|re| re.matches(&ip)))
                 || self.blocklist.iter().any(|re| re.matches(&ip)))
         {
-            let response_opt : Option<HttpResponse> = if let Some(callback) = self.block_handler {
+            let response_opt: Option<HttpResponse> = if let Some(callback) = self.block_handler {
                 callback(&middleware_to_filter(self), &ip, &req)
             } else {
                 None
             };
             return if let Some(res) = response_opt {
-                Box::pin(ok(req.into_response(res.into_body())))
+                Box::pin(ok(req.into_response(res).map_body(|_, body| AnyBody::new_boxed(body))))
             } else {
                 Box::pin(ok(req.error_response(ErrorForbidden("Forbidden"))))
             };
@@ -438,15 +446,22 @@ where
                 callback(&middleware_to_filter(self), &ip, &req)
             }
         }
-
-        Box::pin(self.service.call(req))
+        let service = Rc::clone(&self.service);
+        async move {
+            service
+                .call(req)
+                .await
+                .map(|res| res.map_body(|_, body| AnyBody::new_boxed(body)))
+        }
+        .boxed_local()
     }
 }
 
-fn middleware_to_filter<S, B>(middleware: &mut IPFilterMiddleware<S>) -> IPFilter
+fn middleware_to_filter<S, B>(middleware: &IPFilterMiddleware<S>) -> IPFilter
 where
-    S: Service<Request = ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    B: 'static,
+    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
+    B: MessageBody + 'static,
+    B::Error: StdError,
 {
     IPFilter {
         use_x_real_ip: middleware.use_x_real_ip,
@@ -504,7 +519,8 @@ mod tests {
     async fn test_xrealip() {
         let ip_filter = IPFilter::new().allow(vec!["192.168.*.11?"]).x_real_ip(true);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
-        let req = test::TestRequest::with_header("X-REAL-IP", "192.168.0.111")
+        let req = test::TestRequest::default()
+            .insert_header(("X-REAL-IP", "192.168.0.111"))
             .peer_addr("192.168.0.222:8888".parse().unwrap())
             .to_srv_request();
         let resp = test::call_service(&mut fltr, req).await;
@@ -535,7 +551,6 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_allow_handler() {
-
         let ip_filter = IPFilter::new()
             .allow(vec!["192.168.*.11?"])
             .limit_to(vec!["/protected/path/*"]);
@@ -543,7 +558,6 @@ mod tests {
         //let mut allow_count: u32 = 0;
 
         // Use closure instead of fn in order to capture ip_filter and allow_count.
-
 
         //let my_custom_handler = |filter: &IPFilter, ip: &str, req: &ServiceRequest| {
         //    allow_count += 1;
@@ -554,7 +568,12 @@ mod tests {
 
         fn my_custom_handler(_filter: &IPFilter, ip: &str, req: &ServiceRequest) {
             assert_eq!(Pattern::new("192.168.*.11?").unwrap().matches(ip), true);
-            assert_eq!(Pattern::new("/protected/path/*").unwrap().matches(req.path()), true);
+            assert_eq!(
+                Pattern::new("/protected/path/*")
+                    .unwrap()
+                    .matches(req.path()),
+                true
+            );
         }
 
         // De-mut and attach custom handler to IPFilter.
@@ -585,10 +604,18 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_block_handler() {
-
-        fn my_custom_handler(_filter: &IPFilter, ip: &str, req: &ServiceRequest) -> Option<HttpResponse> {
+        fn my_custom_handler(
+            _filter: &IPFilter,
+            ip: &str,
+            req: &ServiceRequest,
+        ) -> Option<HttpResponse> {
             assert_eq!(Pattern::new("192.168.*.11?").unwrap().matches(ip), false);
-            assert_eq!(Pattern::new("/protected/path/*").unwrap().matches(req.path()), true);
+            assert_eq!(
+                Pattern::new("/protected/path/*")
+                    .unwrap()
+                    .matches(req.path()),
+                true
+            );
             Some(HttpResponse::UseProxy().json("{\"result\": \"error\"}"))
         }
 
@@ -604,7 +631,11 @@ mod tests {
         let resp = test::call_service(&mut fltr, req).await;
         assert_eq!(resp.status(), StatusCode::USE_PROXY);
 
-        fn logging_handler(_filter: &IPFilter, _ip: &str, _req: &ServiceRequest) -> Option<HttpResponse> {
+        fn logging_handler(
+            _filter: &IPFilter,
+            _ip: &str,
+            _req: &ServiceRequest,
+        ) -> Option<HttpResponse> {
             None
         }
 
