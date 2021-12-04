@@ -199,12 +199,10 @@ use actix_web::{
     error::ErrorForbidden,
     Error, HttpResponse,
 };
-use futures_util::future::{ok, Either, FutureExt as _, LocalBoxFuture, Ready};
+use futures_util::future::{ok, FutureExt as _, LocalBoxFuture, Ready};
 use glob::Pattern;
-use std::pin::Pin;
 use std::error::Error as StdError;
 use std::rc::Rc;
-use std::task::{Context, Poll};
 
 fn wrap_pattern(list: Vec<&str>) -> Rc<Vec<Pattern>> {
     Rc::new(
