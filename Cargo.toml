@@ -17,10 +17,10 @@ name = "actix_ip_filter"
 path = "src/lib.rs"
 
 [dependencies]
-actix-service = "1.0.6"
-actix-web = { version = "3.0.2", default-features = false }
-futures-util = { version = "0.3.5", default-features = false }
+actix-service = "2.0.1"
+actix-web = { version = "4.0.0-beta.13", default-features = false }
+futures-util = { version = "0.3.7", default-features = false }
 glob = "0.3.0"
 
 [dev-dependencies]
-actix-rt = "1.1.1"
+actix-rt = "2.5.0"
