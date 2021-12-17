@@ -194,14 +194,13 @@
 
 use actix_service::{Service, Transform};
 use actix_web::{
-    body::{AnyBody, MessageBody},
+    body::{EitherBody, MessageBody},
     dev::{ServiceRequest, ServiceResponse},
     error::ErrorForbidden,
     Error, HttpResponse,
 };
 use futures_util::future::{ok, FutureExt as _, LocalBoxFuture, Ready};
 use glob::Pattern;
-use std::error::Error as StdError;
 use std::rc::Rc;
 
 fn wrap_pattern(list: Vec<&str>) -> Rc<Vec<Pattern>> {
@@ -367,9 +366,8 @@ where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: MessageBody + 'static,
-    B::Error: StdError,
 {
-    type Response = ServiceResponse;
+    type Response = ServiceResponse<EitherBody<B>>;
     type Error = Error;
     type Transform = IPFilterMiddleware<S>;
     type InitError = ();
@@ -404,11 +402,10 @@ where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error> + 'static,
     S::Future: 'static,
     B: MessageBody + 'static,
-    B::Error: StdError,
 {
-    type Response = ServiceResponse;
+    type Response = ServiceResponse<EitherBody<B>>;
     type Error = Error;
-    type Future = LocalBoxFuture<'static, Result<ServiceResponse, Error>>;
+    type Future = LocalBoxFuture<'static, Result<ServiceResponse<EitherBody<B>>, Error>>;
 
     actix_service::forward_ready!(service);
 
@@ -433,9 +430,9 @@ where
                 None
             };
             return if let Some(res) = response_opt {
-                Box::pin(ok(req.into_response(res)))
+                Box::pin(ok(req.into_response(res).map_into_right_body()))
             } else {
-                Box::pin(ok(req.error_response(ErrorForbidden("Forbidden"))))
+                Box::pin(ok(req.error_response(ErrorForbidden("Forbidden")).map_into_right_body()))
             };
         }
 
@@ -449,7 +446,7 @@ where
             service
                 .call(req)
                 .await
-                .map(|res| res.map_body(|_, body| AnyBody::new_boxed(body)))
+                .map(|res| res.map_into_left_body())
         }
         .boxed_local()
     }
@@ -459,7 +456,6 @@ fn middleware_to_filter<S, B>(middleware: &IPFilterMiddleware<S>) -> IPFilter
 where
     S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
     B: MessageBody + 'static,
-    B::Error: StdError,
 {
     IPFilter {
         use_x_real_ip: middleware.use_x_real_ip,
