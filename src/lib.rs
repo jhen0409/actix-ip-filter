@@ -12,7 +12,7 @@
 //!     "Hello world"
 //! }
 //!
-//! #[actix_web::main]
+//! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!     HttpServer::new(|| App::new()
 //!         // enable logger
@@ -47,7 +47,7 @@
 //!     "I am NOT a protected resource"
 //! }
 //!
-//! #[actix_web::main]
+//! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!
 //!
@@ -108,7 +108,7 @@
 //!     "I am NOT a protected resource"
 //! }
 //!
-//! #[actix_web::main]
+//! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!
 //!
@@ -167,7 +167,7 @@
 //!     "I am NOT a protected resource"
 //! }
 //!
-//! #[actix_web::main]
+//! #[tokio::main]
 //! async fn main() -> std::io::Result<()> {
 //!
 //!
