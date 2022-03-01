@@ -17,7 +17,7 @@ async fn index(req: HttpRequest) -> &'static str {
     "Hello world"
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
     HttpServer::new(|| App::new()
         // enable logger
@@ -54,7 +54,7 @@ async fn i_am_unprotected() -> &'static str {
     "I am NOT a protected resource"
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
 
 
@@ -120,7 +120,7 @@ async fn i_am_unprotected() -> &'static str {
     "I am NOT a protected resource"
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
 
 
@@ -184,7 +184,7 @@ async fn i_am_unprotected() -> &'static str {
     "I am NOT a protected resource"
 }
 
-#[actix_web::main]
+#[tokio::main]
 async fn main() -> std::io::Result<()> {
 
 
