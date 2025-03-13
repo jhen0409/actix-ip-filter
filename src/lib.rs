@@ -22,6 +22,8 @@
 //!             IPFilter::new()
 //!                 .allow(vec!["172.??.6*.12"])
 //!                 .block(vec!["192.168.1.222"])
+//!                 // Optionally use X-Forwarded-For with realip_remote_addr
+//!                 // .use_realip_remote_addr(true)
 //!         )
 //!         // register simple route, handle all methods
 //!         .service(web::resource("/").to(index))
@@ -31,6 +33,25 @@
 //! }
 //!
 //! ```
+//! 
+//! ## IP Address Extraction Options
+//! 
+//! The middleware provides several methods to extract the client IP address:
+//! 
+//! 1. **Default**: Uses the peer address from the socket connection
+//! 2. **X-REAL-IP**: Extracts the IP from the X-REAL-IP header if present with `.x_real_ip(true)`
+//! 3. **X-Forwarded-For**: Uses Actix's built-in `realip_remote_addr()` method with `.use_realip_remote_addr(true)`, which extracts the client IP from the X-Forwarded-For header
+//! 
+//! When deployed behind proxies like AWS Elastic Load Balancer that set the X-Forwarded-For header instead of X-REAL-IP, using the `use_realip_remote_addr` option is recommended:
+//! 
+//! ```rust
+//! use actix_ip_filter::IPFilter;
+//! 
+//! let filter = IPFilter::new()
+//!     .allow(vec!["192.168.1.*"])
+//!     .use_realip_remote_addr(true);
+//! ```
+//! 
 //! ## Limiting to certain paths
 //! You can limit the allow/block actions to a certain set of patterns representing URL paths.
 //! The following code will only allow/block to paths matching the patterns `/my/path*` and
@@ -214,6 +235,7 @@ fn wrap_pattern(list: Vec<&str>) -> Rc<Vec<Pattern>> {
 /// Middleware for filter IP of HTTP requests
 pub struct IPFilter {
     use_x_real_ip: bool,
+    use_realip_remote_addr: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
     limitlist: Rc<Vec<Pattern>>,
@@ -225,6 +247,7 @@ impl Default for IPFilter {
     fn default() -> Self {
         Self {
             use_x_real_ip: false,
+            use_realip_remote_addr: false,
             allowlist: Rc::new(vec![]),
             blocklist: Rc::new(vec![]),
             limitlist: Rc::new(vec![]),
@@ -244,6 +267,7 @@ impl IPFilter {
     pub fn new_with_opts(allowlist: Vec<&str>, blocklist: Vec<&str>, use_x_real_ip: bool) -> Self {
         IPFilter {
             use_x_real_ip,
+            use_realip_remote_addr: false,
             allowlist: wrap_pattern(allowlist),
             blocklist: wrap_pattern(blocklist),
             limitlist: wrap_pattern(vec![]),
@@ -261,6 +285,7 @@ impl IPFilter {
     ) -> Self {
         IPFilter {
             use_x_real_ip,
+            use_realip_remote_addr: false,
             allowlist: wrap_pattern(allowlist),
             blocklist: wrap_pattern(blocklist),
             limitlist: wrap_pattern(limitlist),
@@ -272,6 +297,13 @@ impl IPFilter {
     /// Use `X-REAL-IP` header to check IP if it is found in request.
     pub fn x_real_ip(mut self, enabled: bool) -> Self {
         self.use_x_real_ip = enabled;
+        self
+    }
+    
+    /// Use Actix's `ConnectionInfo::realip_remote_addr()` to obtain peer address.
+    /// This will use the first IP in the `X-Forwarded-For` header when present.
+    pub fn use_realip_remote_addr(mut self, enabled: bool) -> Self {
+        self.use_realip_remote_addr = enabled;
         self
     }
 
@@ -377,6 +409,7 @@ where
         ok(IPFilterMiddleware {
             service: Rc::new(service),
             use_x_real_ip: self.use_x_real_ip,
+            use_realip_remote_addr: self.use_realip_remote_addr,
             allowlist: Rc::clone(&self.allowlist),
             blocklist: Rc::clone(&self.blocklist),
             limitlist: Rc::clone(&self.limitlist),
@@ -390,6 +423,7 @@ where
 pub struct IPFilterMiddleware<S> {
     service: Rc<S>,
     use_x_real_ip: bool,
+    use_realip_remote_addr: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
     limitlist: Rc<Vec<Pattern>>,
@@ -411,7 +445,13 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let peer_addr_ip = req.peer_addr().unwrap().ip().to_string();
-        let ip = if self.use_x_real_ip {
+        let ip = if self.use_realip_remote_addr {
+            let conn = req.connection_info();
+            match conn.realip_remote_addr() {
+                Some(addr) => String::from(addr),
+                None => peer_addr_ip,
+            }
+        } else if self.use_x_real_ip {
             match req.headers().get("X-REAL-IP") {
                 Some(header) => String::from(header.to_str().unwrap()),
                 None => peer_addr_ip,
@@ -459,6 +499,7 @@ where
 {
     IPFilter {
         use_x_real_ip: middleware.use_x_real_ip,
+        use_realip_remote_addr: middleware.use_realip_remote_addr,
         allowlist: middleware.allowlist.clone(),
         blocklist: middleware.blocklist.clone(),
         limitlist: middleware.limitlist.clone(),
@@ -515,6 +556,18 @@ mod tests {
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
         let req = test::TestRequest::default()
             .insert_header(("X-REAL-IP", "192.168.0.111"))
+            .peer_addr("192.168.0.222:8888".parse().unwrap())
+            .to_srv_request();
+        let resp = test::call_service(&mut fltr, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    
+    #[actix_rt::test]
+    async fn test_realip_remote_addr() {
+        let ip_filter = IPFilter::new().allow(vec!["192.168.*.11?"]).use_realip_remote_addr(true);
+        let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
+        let req = test::TestRequest::default()
+            .insert_header(("X-Forwarded-For", "192.168.0.111, 10.0.0.1"))
             .peer_addr("192.168.0.222:8888".parse().unwrap())
             .to_srv_request();
         let resp = test::call_service(&mut fltr, req).await;
