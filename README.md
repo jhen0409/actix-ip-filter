@@ -27,6 +27,8 @@ async fn main() -> std::io::Result<()> {
             IPFilter::new()
                 .allow(vec!["172.??.6*.12"])
                 .block(vec!["192.168.1.222"])
+                // Optionally use X-Forwarded-For with realip_remote_addr
+                // .use_realip_remote_addr(true)
         )
         // register simple route, handle all methods
         .service(web::resource("/").to(index))
@@ -34,6 +36,24 @@ async fn main() -> std::io::Result<()> {
         .bind("0.0.0.0:8080")?;
     Ok(())
 }
+```
+
+### IP Address Extraction Options
+
+The middleware provides several methods to extract the client IP address:
+
+1. **Default**: Uses the peer address from the socket connection
+2. **X-REAL-IP**: Extracts the IP from the X-REAL-IP header if present with `.x_real_ip(true)`
+3. **X-Forwarded-For**: Uses Actix's built-in `realip_remote_addr()` method with `.use_realip_remote_addr(true)`, which extracts the client IP from the X-Forwarded-For header
+
+When deployed behind proxies like AWS Elastic Load Balancer that set the X-Forwarded-For header instead of X-REAL-IP, using the `use_realip_remote_addr` option is recommended:
+
+```rust
+use actix_ip_filter::IPFilter;
+
+let filter = IPFilter::new()
+    .allow(vec!["192.168.1.*"])
+    .use_realip_remote_addr(true);
 ```
 
 ### Limiting to certain paths
