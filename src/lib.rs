@@ -33,25 +33,25 @@
 //! }
 //!
 //! ```
-//! 
+//!
 //! ## IP Address Extraction Options
-//! 
+//!
 //! The middleware provides several methods to extract the client IP address:
-//! 
+//!
 //! 1. **Default**: Uses the peer address from the socket connection
 //! 2. **X-REAL-IP**: Extracts the IP from the X-REAL-IP header if present with `.x_real_ip(true)`
 //! 3. **X-Forwarded-For**: Uses Actix's built-in `realip_remote_addr()` method with `.use_realip_remote_addr(true)`, which extracts the client IP from the X-Forwarded-For header
-//! 
+//!
 //! When deployed behind proxies like AWS Elastic Load Balancer that set the X-Forwarded-For header instead of X-REAL-IP, using the `use_realip_remote_addr` option is recommended:
-//! 
+//!
 //! ```rust
 //! use actix_ip_filter::IPFilter;
-//! 
+//!
 //! let filter = IPFilter::new()
 //!     .allow(vec!["192.168.1.*"])
 //!     .use_realip_remote_addr(true);
 //! ```
-//! 
+//!
 //! ## Limiting to certain paths
 //! You can limit the allow/block actions to a certain set of patterns representing URL paths.
 //! The following code will only allow/block to paths matching the patterns `/my/path*` and
@@ -218,11 +218,12 @@ use actix_web::{
     body::{EitherBody, MessageBody},
     dev::{ServiceRequest, ServiceResponse},
     error::ErrorForbidden,
-    Error, HttpResponse,
+    Error, HttpRequest, HttpResponse,
 };
 use futures_util::future::{ok, FutureExt as _, LocalBoxFuture, Ready};
 use glob::Pattern;
-use std::rc::Rc;
+use ipware::{HeaderName, IpWare, IpWareConfig, IpWareProxy};
+use std::{net::IpAddr, rc::Rc, str::FromStr};
 
 fn wrap_pattern(list: Vec<&str>) -> Rc<Vec<Pattern>> {
     Rc::new(
@@ -232,21 +233,33 @@ fn wrap_pattern(list: Vec<&str>) -> Rc<Vec<Pattern>> {
     )
 }
 
+type AllowHandler = fn(&IPFilter, &str, &ServiceRequest) -> ();
+type DenyHandler = fn(&IPFilter, &str, &ServiceRequest) -> Option<HttpResponse>;
+
 /// Middleware for filter IP of HTTP requests
+#[derive(Clone)]
 pub struct IPFilter {
-    use_x_real_ip: bool,
+    headers: Vec<HeaderName>,
+    proxy_count: u16,
+    proxy_list: Vec<IpAddr>,
+    strict_mode: bool,
+    allow_untrusted: bool,
     use_realip_remote_addr: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
     limitlist: Rc<Vec<Pattern>>,
-    allow_handler: Option<fn(&Self, &str, &ServiceRequest) -> ()>,
-    block_handler: Option<fn(&Self, &str, &ServiceRequest) -> Option<HttpResponse>>,
+    allow_handler: Option<AllowHandler>,
+    block_handler: Option<DenyHandler>,
 }
 
 impl Default for IPFilter {
     fn default() -> Self {
         Self {
-            use_x_real_ip: false,
+            headers: Vec::new(),
+            proxy_count: 0,
+            proxy_list: Vec::new(),
+            strict_mode: true,
+            allow_untrusted: false,
             use_realip_remote_addr: false,
             allowlist: Rc::new(vec![]),
             blocklist: Rc::new(vec![]),
@@ -266,14 +279,13 @@ impl IPFilter {
     /// Construct `IPFilter` middleware with the provided arguments and no limiting pattern.
     pub fn new_with_opts(allowlist: Vec<&str>, blocklist: Vec<&str>, use_x_real_ip: bool) -> Self {
         IPFilter {
-            use_x_real_ip,
             use_realip_remote_addr: false,
             allowlist: wrap_pattern(allowlist),
             blocklist: wrap_pattern(blocklist),
             limitlist: wrap_pattern(vec![]),
-            allow_handler: None,
-            block_handler: None,
+            ..Default::default()
         }
+        .x_real_ip(use_x_real_ip)
     }
 
     /// Construct `IPFilter` middleware with the provided arguments and limiting patterns.
@@ -284,26 +296,90 @@ impl IPFilter {
         use_x_real_ip: bool,
     ) -> Self {
         IPFilter {
-            use_x_real_ip,
-            use_realip_remote_addr: false,
             allowlist: wrap_pattern(allowlist),
             blocklist: wrap_pattern(blocklist),
             limitlist: wrap_pattern(limitlist),
-            allow_handler: None,
-            block_handler: None,
+            ..Default::default()
         }
+        .x_real_ip(use_x_real_ip)
     }
 
     /// Use `X-REAL-IP` header to check IP if it is found in request.
     pub fn x_real_ip(mut self, enabled: bool) -> Self {
-        self.use_x_real_ip = enabled;
+        let x_real_ip = HeaderName::from_static("x-real-ip");
+        match enabled {
+            true => self.headers.push(x_real_ip),
+            false => self.headers.retain(|header| header != x_real_ip),
+        }
+        self.allow_untrusted = true;
         self
     }
-    
+
     /// Use Actix's `ConnectionInfo::realip_remote_addr()` to obtain peer address.
     /// This will use the first IP in the `X-Forwarded-For` header when present.
     pub fn use_realip_remote_addr(mut self, enabled: bool) -> Self {
         self.use_realip_remote_addr = enabled;
+        self.allow_untrusted = true;
+        self
+    }
+
+    /// Configure Middleware to determine ip from the given header.
+    ///
+    /// Headers are prioritized in the order they are configured.
+    ///
+    /// ### Example
+    ///
+    /// ```
+    /// use actix_ip_filter::IPFilter;
+    ///
+    /// let middlware = IPFilter::new()
+    ///     .read_header("X-Real-IP")
+    ///     .read_header("CF-Connecting-IP")
+    ///     .read_header("X-Forwarded-For");
+    /// ```
+    pub fn read_header(mut self, header: &str) -> Self {
+        if let Ok(header) = HeaderName::from_str(header) {
+            self.headers.push(header);
+        }
+        self
+    }
+
+    /// Configure the number of expected upstream proxies.
+    ///
+    /// This determines whether the middleware should trust
+    /// the ips associated with the request headers or not.
+    ///
+    /// Total number of expected proxies (pattern: `client, proxy1, ..., proxy2`)
+    /// if `proxy_count = 0` then `client`
+    /// if `proxy_count = 1` then `client, proxy1`
+    /// if `proxy_count = 2` then `client, proxy1, proxy2`
+    /// if `proxy_count = 3` then `client, proxy1, proxy2 proxy3`
+    pub fn proxy_count(mut self, proxy_count: u16) -> Self {
+        self.proxy_count = proxy_count;
+        self
+    }
+
+    /// Configure a trusted upstream proxy ip-address.
+    ///
+    /// This determines whether the middleware should trust
+    /// the ips associated with the requets headers or not.
+    ///
+    /// List of trusted proxies (pattern: `client, proxy1, ..., proxy2`)
+    /// if `proxy_list = ['10.1.1.1']` then `client, 10.1.1.1` OR `client, proxy1, 10.1.1.1`
+    /// if `proxy_list = ['10.1.1.1', '10.2.2.2']` then `client, 10.1.1.1` OR `client, proxy1, 10.2.2.2`
+    /// if `proxy_list = ['10.1.1.1', '10.2.2.2']` then `client, 10.1.1.1 10.2.2.2` OR `client, 10.1.1.1 10.2.2.2`
+    pub fn trust_proxy(mut self, proxy_ip: IpAddr) -> Self {
+        self.proxy_list.push(proxy_ip);
+        self
+    }
+
+    /// Allow untrusted client ips retrieved from allowed headers if enabled.
+    ///
+    /// If the request did not match the expected [`IPFilter::proxy_count`]
+    /// and/or [`IPFilter::trust_proxy`] configuration, the client-ip will
+    /// be labled as "untrusted".
+    pub fn allow_untrusted(mut self, allow_untrusted: bool) -> Self {
+        self.allow_untrusted = allow_untrusted;
         self
     }
 
@@ -407,8 +483,14 @@ where
 
     fn new_transform(&self, service: S) -> Self::Future {
         ok(IPFilterMiddleware {
+            ip_filter: self.clone(),
             service: Rc::new(service),
-            use_x_real_ip: self.use_x_real_ip,
+            ipware: IpWare::new(
+                IpWareConfig::new(self.headers.clone(), true),
+                IpWareProxy::new(self.proxy_count, self.proxy_list.clone()),
+            ),
+            strict_mode: self.strict_mode,
+            allow_untrusted: self.allow_untrusted,
             use_realip_remote_addr: self.use_realip_remote_addr,
             allowlist: Rc::clone(&self.allowlist),
             blocklist: Rc::clone(&self.blocklist),
@@ -421,14 +503,59 @@ where
 
 #[derive(Clone)]
 pub struct IPFilterMiddleware<S> {
+    ip_filter: IPFilter,
     service: Rc<S>,
-    use_x_real_ip: bool,
+    ipware: IpWare,
+    strict_mode: bool,
+    allow_untrusted: bool,
     use_realip_remote_addr: bool,
     allowlist: Rc<Vec<Pattern>>,
     blocklist: Rc<Vec<Pattern>>,
     limitlist: Rc<Vec<Pattern>>,
-    allow_handler: Option<fn(&IPFilter, &str, &ServiceRequest) -> ()>,
-    block_handler: Option<fn(&IPFilter, &str, &ServiceRequest) -> Option<HttpResponse>>,
+    allow_handler: Option<AllowHandler>,
+    block_handler: Option<DenyHandler>,
+}
+
+impl<S> IPFilterMiddleware<S> {
+    /// Retrieve IP address associated with request
+    #[inline]
+    fn get_ip(&self, req: &HttpRequest) -> (String, bool) {
+        if self.use_realip_remote_addr {
+            if let Some(addr) = req.connection_info().realip_remote_addr() {
+                return (addr.to_owned(), false);
+            }
+        }
+
+        let headers: ipware::HeaderMap = req.headers().into();
+        let (ip, trusted_route) = self.ipware.get_client_ip(&headers, self.strict_mode);
+        if let Some(ip) = ip {
+            if trusted_route || self.allow_untrusted {
+                return (ip.to_string(), trusted_route);
+            }
+        }
+
+        let ip = req
+            .peer_addr()
+            .map(|addr| addr.ip())
+            .map(|ip| ip.to_string())
+            .expect("failed to find request ip-address");
+        (ip, true)
+    }
+
+    /// Determine if IP address should be blocked
+    #[inline]
+    fn is_block(&self, trusted: bool, ip: &str, req_path: &str) -> bool {
+        if !trusted && !self.allow_untrusted {
+            return true;
+        }
+        if !self.limitlist.is_empty() && !self.limitlist.iter().any(|re| re.matches(req_path)) {
+            return false;
+        }
+        if !self.allowlist.is_empty() {
+            return !self.allowlist.iter().any(|re| re.matches(ip));
+        }
+        self.blocklist.iter().any(|re| re.matches(ip))
+    }
 }
 
 impl<S, B> Service<ServiceRequest> for IPFilterMiddleware<S>
@@ -444,67 +571,30 @@ where
     actix_service::forward_ready!(service);
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
-        let peer_addr_ip = req.peer_addr().unwrap().ip().to_string();
-        let ip = if self.use_realip_remote_addr {
-            let conn = req.connection_info();
-            match conn.realip_remote_addr() {
-                Some(addr) => String::from(addr),
-                None => peer_addr_ip,
-            }
-        } else if self.use_x_real_ip {
-            match req.headers().get("X-REAL-IP") {
-                Some(header) => String::from(header.to_str().unwrap()),
-                None => peer_addr_ip,
-            }
-        } else {
-            peer_addr_ip
-        };
+        let (ip, trusted) = self.get_ip(req.request());
 
-        if (self.limitlist.is_empty() || self.limitlist.iter().any(|re| re.matches(req.path())))
-            && ((!self.allowlist.is_empty() && !self.allowlist.iter().any(|re| re.matches(&ip)))
-                || self.blocklist.iter().any(|re| re.matches(&ip)))
-        {
+        if self.is_block(trusted, &ip, req.path()) {
             let response_opt: Option<HttpResponse> = if let Some(callback) = self.block_handler {
-                callback(&middleware_to_filter(self), &ip, &req)
+                callback(&self.ip_filter, &ip, &req)
             } else {
                 None
             };
             return if let Some(res) = response_opt {
                 Box::pin(ok(req.into_response(res).map_into_right_body()))
             } else {
-                Box::pin(ok(req.error_response(ErrorForbidden("Forbidden")).map_into_right_body()))
+                Box::pin(ok(req
+                    .error_response(ErrorForbidden("Forbidden"))
+                    .map_into_right_body()))
             };
         }
 
         if let Some(callback) = self.allow_handler {
             if self.limitlist.is_empty() || self.limitlist.iter().any(|re| re.matches(req.path())) {
-                callback(&middleware_to_filter(self), &ip, &req)
+                callback(&self.ip_filter, &ip, &req)
             }
         }
         let service = Rc::clone(&self.service);
-        async move {
-            service
-                .call(req)
-                .await
-                .map(|res| res.map_into_left_body())
-        }
-        .boxed_local()
-    }
-}
-
-fn middleware_to_filter<S, B>(middleware: &IPFilterMiddleware<S>) -> IPFilter
-where
-    S: Service<ServiceRequest, Response = ServiceResponse<B>, Error = Error>,
-    B: MessageBody + 'static,
-{
-    IPFilter {
-        use_x_real_ip: middleware.use_x_real_ip,
-        use_realip_remote_addr: middleware.use_realip_remote_addr,
-        allowlist: middleware.allowlist.clone(),
-        blocklist: middleware.blocklist.clone(),
-        limitlist: middleware.limitlist.clone(),
-        allow_handler: middleware.allow_handler,
-        block_handler: middleware.block_handler,
+        async move { service.call(req).await.map(|res| res.map_into_left_body()) }.boxed_local()
     }
 }
 
@@ -561,10 +651,12 @@ mod tests {
         let resp = test::call_service(&mut fltr, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
     }
-    
+
     #[actix_rt::test]
     async fn test_realip_remote_addr() {
-        let ip_filter = IPFilter::new().allow(vec!["192.168.*.11?"]).use_realip_remote_addr(true);
+        let ip_filter = IPFilter::new()
+            .allow(vec!["192.168.*.11?"])
+            .use_realip_remote_addr(true);
         let mut fltr = ip_filter.new_transform(test::ok_service()).await.unwrap();
         let req = test::TestRequest::default()
             .insert_header(("X-Forwarded-For", "192.168.0.111, 10.0.0.1"))
